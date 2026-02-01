@@ -1,4 +1,4 @@
-# ulp-parser
+# processor
 
 a fast credential log parser written in rust. handles the messy formats you find in stealer logs - the ones with `url:username:password` lines, block-style password files, nested archives, all that stuff.
 
