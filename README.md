@@ -143,7 +143,7 @@ for large archives with thousands of password files, this makes a big difference
 ## dependencies
 
 - `7z` - must be installed and in PATH (or next to the exe on windows)
-- on linux, `unrar` is used for rar files if available
+- rar extraction uses the `unrar` Rust crate (bundled unrar library)
 
 ## supported archive formats
 

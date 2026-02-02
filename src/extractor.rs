@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use unrar::Archive;
 use walkdir::WalkDir;
 
 fn get_7z_path() -> PathBuf {
@@ -18,11 +19,6 @@ fn get_7z_path() -> PathBuf {
         }
     }
     PathBuf::from("7z")
-}
-
-#[cfg(not(windows))]
-fn get_unrar_path() -> PathBuf {
-    PathBuf::from("unrar")
 }
 
 const ARCHIVE_EXTENSIONS: &[&str] = &[".zip", ".7z", ".rar", ".tar", ".gz", ".tar.gz", ".tgz"];
@@ -73,13 +69,8 @@ pub enum ExtractError {
     #[error("7z not found in PATH. Please install 7z and ensure it's in your PATH.")]
     SevenZipNotFound,
 
-    #[cfg(not(windows))]
-    #[error("unrar command failed: {0}")]
+    #[error("unrar extraction failed: {0}")]
     UnrarFailed(String),
-
-    #[cfg(not(windows))]
-    #[error("unrar not found in PATH. Please install unrar and ensure it's in your PATH.")]
-    UnrarNotFound,
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -88,10 +79,54 @@ pub enum ExtractError {
     ArchiveNotFound(PathBuf),
 }
 
-#[cfg(not(windows))]
 fn is_rar(path: &Path) -> bool {
     let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
     name.to_lowercase().ends_with(".rar")
+}
+
+fn matches_unrar_entry(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if TARGET_FILES.iter().any(|target| lower.ends_with(target)) {
+        return true;
+    }
+
+    ARCHIVE_PATTERNS
+        .iter()
+        .any(|pattern| glob_match(&lower, &format!("*{}", pattern)))
+}
+
+fn glob_match(text: &str, pattern: &str) -> bool {
+    let text = text.as_bytes();
+    let pattern = pattern.as_bytes();
+    let mut text_index = 0;
+    let mut pattern_index = 0;
+    let mut star_index = None;
+    let mut match_index = 0;
+
+    while text_index < text.len() {
+        if pattern_index < pattern.len()
+            && (pattern[pattern_index] == b'?' || pattern[pattern_index] == text[text_index])
+        {
+            text_index += 1;
+            pattern_index += 1;
+        } else if pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+            star_index = Some(pattern_index);
+            match_index = text_index;
+            pattern_index += 1;
+        } else if let Some(star) = star_index {
+            pattern_index = star + 1;
+            match_index += 1;
+            text_index = match_index;
+        } else {
+            return false;
+        }
+    }
+
+    while pattern_index < pattern.len() && pattern[pattern_index] == b'*' {
+        pattern_index += 1;
+    }
+
+    pattern_index == pattern.len()
 }
 
 pub fn is_archive(path: &Path) -> bool {
@@ -151,77 +186,68 @@ pub fn extract_archive(
 
     fs::create_dir_all(output_dir)?;
 
-    #[cfg(windows)]
-    {
+    if is_rar(archive_path) {
+        extract_with_unrar(archive_path, output_dir, opts)
+    } else {
         extract_with_7z(archive_path, output_dir, opts)
-    }
-
-    #[cfg(not(windows))]
-    {
-        if is_rar(archive_path) {
-            extract_with_unrar(archive_path, output_dir, opts)
-        } else {
-            extract_with_7z(archive_path, output_dir, opts)
-        }
     }
 }
 
-#[cfg(not(windows))]
 fn extract_with_unrar(
     archive_path: &Path,
     output_dir: &Path,
     opts: &ExtractOptions,
 ) -> ExtractResult<()> {
-    let mut cmd = Command::new(get_unrar_path());
-    cmd.args(["x", "-o+"]);
-
-    if let Some(pw) = opts.password {
-        cmd.arg(format!("-p{}", pw));
+    let archive = match opts.password {
+        Some(pw) => Archive::with_password(archive_path, pw.as_bytes()),
+        None => Archive::new(archive_path),
     }
+    .as_first_part();
 
-    if let Some(threads) = opts.threads {
-        cmd.arg(format!("-mt{}", threads));
-    }
+    let mut open = archive
+        .open_for_processing()
+        .map_err(|e| ExtractError::UnrarFailed(e.to_string()))?;
 
-    for target in TARGET_FILES {
-        cmd.arg(format!("-n*{}", target));
-    }
+    while let Some(header) = match open.read_header() {
+        Ok(next) => next,
+        Err(err) => {
+            if has_content(output_dir) {
+                eprintln!("unrar warning (continuing): {}", err);
+                return Ok(());
+            }
+            return Err(ExtractError::UnrarFailed(err.to_string()));
+        }
+    } {
+        let entry = header.entry();
+        let entry_name = entry.filename.to_string_lossy();
+        let should_extract = entry.is_file() && matches_unrar_entry(&entry_name);
 
-    for ext in ARCHIVE_PATTERNS {
-        cmd.arg(format!("-n*{}", ext));
-    }
-
-    cmd.arg(archive_path);
-    cmd.arg(format!("{}/", output_dir.display()));
-
-    let output = cmd.output();
-
-    match output {
-        Ok(result) => {
-            if result.status.success() {
-                Ok(())
-            } else {
-                let stderr = String::from_utf8_lossy(&result.stderr);
-                let stdout = String::from_utf8_lossy(&result.stdout);
-                if has_content(output_dir)
-                    || stderr.contains("No files to extract")
-                    || stdout.contains("No files to extract")
-                {
-                    if !stderr.is_empty() && !stderr.contains("No files to extract") {
-                        eprintln!("unrar warning (continuing): {}", stderr);
+        open = if should_extract {
+            match header.extract_with_base(output_dir) {
+                Ok(next) => next,
+                Err(err) => {
+                    if has_content(output_dir) {
+                        eprintln!("unrar warning (continuing): {}", err);
+                        return Ok(());
                     }
-                    Ok(())
-                } else {
-                    Err(ExtractError::UnrarFailed(format!(
-                        "stdout: {}\nstderr: {}",
-                        stdout, stderr
-                    )))
+                    return Err(ExtractError::UnrarFailed(err.to_string()));
                 }
             }
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ExtractError::UnrarNotFound),
-        Err(e) => Err(ExtractError::Io(e)),
+        } else {
+            match header.skip() {
+                Ok(next) => next,
+                Err(err) => {
+                    if has_content(output_dir) {
+                        eprintln!("unrar warning (continuing): {}", err);
+                        return Ok(());
+                    }
+                    return Err(ExtractError::UnrarFailed(err.to_string()));
+                }
+            }
+        };
     }
+
+    Ok(())
 }
 
 fn extract_with_7z(
