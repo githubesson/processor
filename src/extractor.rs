@@ -26,6 +26,25 @@ fn get_unrar_path() -> PathBuf {
 }
 
 const ARCHIVE_EXTENSIONS: &[&str] = &[".zip", ".7z", ".rar", ".tar", ".gz", ".tar.gz", ".tgz"];
+const ARCHIVE_PATTERNS: &[&str] = &[
+    ".zip",
+    ".7z",
+    ".rar",
+    ".tar",
+    ".gz",
+    ".tar.gz",
+    ".tgz",
+    ".zip.*",
+    ".7z.*",
+    ".rar.*",
+    ".tar.*",
+    ".gz.*",
+    ".tar.gz.*",
+    ".tgz.*",
+    ".part*.rar",
+    ".z??",
+    ".r??",
+];
 
 const TARGET_FILES: &[&str] = &[
     "passwords.txt",
@@ -78,7 +97,41 @@ fn is_rar(path: &Path) -> bool {
 pub fn is_archive(path: &Path) -> bool {
     let name = path.file_name().and_then(OsStr::to_str).unwrap_or("");
     let lower = name.to_lowercase();
-    ARCHIVE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext))
+    if let Some(part) = rar_part_number(&lower) {
+        return part == 1;
+    }
+
+    ARCHIVE_EXTENSIONS.iter().any(|ext| lower.ends_with(ext)) || is_multipart_first_part(&lower)
+}
+
+fn is_multipart_first_part(name: &str) -> bool {
+    is_rar_part_first(name)
+        || ARCHIVE_EXTENSIONS
+            .iter()
+            .any(|ext| is_numbered_first_part(name, ext))
+}
+
+fn is_numbered_first_part(name: &str, base_ext: &str) -> bool {
+    if let Some((before_digits, digits)) = name.rsplit_once('.') {
+        if before_digits.ends_with(base_ext) && digits.chars().all(|c| c.is_ascii_digit()) {
+            return digits.parse::<u32>().ok() == Some(1);
+        }
+    }
+    false
+}
+
+fn is_rar_part_first(name: &str) -> bool {
+    rar_part_number(name) == Some(1)
+}
+
+fn rar_part_number(name: &str) -> Option<u32> {
+    let without_rar = name.strip_suffix(".rar")?;
+    let (_, digits) = without_rar.rsplit_once(".part")?;
+    if digits.is_empty() || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+
+    digits.parse::<u32>().ok()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -87,7 +140,11 @@ pub struct ExtractOptions<'a> {
     pub threads: Option<usize>,
 }
 
-pub fn extract_archive(archive_path: &Path, output_dir: &Path, opts: &ExtractOptions) -> ExtractResult<()> {
+pub fn extract_archive(
+    archive_path: &Path,
+    output_dir: &Path,
+    opts: &ExtractOptions,
+) -> ExtractResult<()> {
     if !archive_path.exists() {
         return Err(ExtractError::ArchiveNotFound(archive_path.to_path_buf()));
     }
@@ -110,7 +167,11 @@ pub fn extract_archive(archive_path: &Path, output_dir: &Path, opts: &ExtractOpt
 }
 
 #[cfg(not(windows))]
-fn extract_with_unrar(archive_path: &Path, output_dir: &Path, opts: &ExtractOptions) -> ExtractResult<()> {
+fn extract_with_unrar(
+    archive_path: &Path,
+    output_dir: &Path,
+    opts: &ExtractOptions,
+) -> ExtractResult<()> {
     let mut cmd = Command::new(get_unrar_path());
     cmd.args(["x", "-o+"]);
 
@@ -126,7 +187,7 @@ fn extract_with_unrar(archive_path: &Path, output_dir: &Path, opts: &ExtractOpti
         cmd.arg(format!("-n*{}", target));
     }
 
-    for ext in ARCHIVE_EXTENSIONS {
+    for ext in ARCHIVE_PATTERNS {
         cmd.arg(format!("-n*{}", ext));
     }
 
@@ -142,7 +203,10 @@ fn extract_with_unrar(archive_path: &Path, output_dir: &Path, opts: &ExtractOpti
             } else {
                 let stderr = String::from_utf8_lossy(&result.stderr);
                 let stdout = String::from_utf8_lossy(&result.stdout);
-                if has_content(output_dir) || stderr.contains("No files to extract") || stdout.contains("No files to extract") {
+                if has_content(output_dir)
+                    || stderr.contains("No files to extract")
+                    || stdout.contains("No files to extract")
+                {
                     if !stderr.is_empty() && !stderr.contains("No files to extract") {
                         eprintln!("unrar warning (continuing): {}", stderr);
                     }
@@ -160,7 +224,11 @@ fn extract_with_unrar(archive_path: &Path, output_dir: &Path, opts: &ExtractOpti
     }
 }
 
-fn extract_with_7z(archive_path: &Path, output_dir: &Path, opts: &ExtractOptions) -> ExtractResult<()> {
+fn extract_with_7z(
+    archive_path: &Path,
+    output_dir: &Path,
+    opts: &ExtractOptions,
+) -> ExtractResult<()> {
     let output_arg = format!("-o{}", output_dir.display());
 
     let mut cmd = Command::new(get_7z_path());
@@ -180,7 +248,7 @@ fn extract_with_7z(archive_path: &Path, output_dir: &Path, opts: &ExtractOptions
         cmd.arg(format!("-ir!{}", target));
     }
 
-    for ext in ARCHIVE_EXTENSIONS {
+    for ext in ARCHIVE_PATTERNS {
         cmd.arg(format!("-ir!*{}", ext));
     }
 
@@ -193,7 +261,10 @@ fn extract_with_7z(archive_path: &Path, output_dir: &Path, opts: &ExtractOptions
             } else {
                 let stderr = String::from_utf8_lossy(&result.stderr);
                 let stdout = String::from_utf8_lossy(&result.stdout);
-                if has_content(output_dir) || stderr.contains("No files to process") || stdout.contains("No files to process") {
+                if has_content(output_dir)
+                    || stderr.contains("No files to process")
+                    || stdout.contains("No files to process")
+                {
                     if !stderr.is_empty() && !stderr.contains("No files to process") {
                         eprintln!("7z warning (continuing): {}", stderr);
                     }
@@ -222,7 +293,11 @@ fn has_content(dir: &Path) -> bool {
 pub fn collect_archives(dir: &Path) -> Vec<PathBuf> {
     let mut archives = Vec::new();
 
-    for entry in WalkDir::new(dir).min_depth(1).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(dir)
+        .min_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
         let path = entry.path();
         if path.is_file() && is_archive(path) {
             archives.push(path.to_path_buf());
@@ -252,11 +327,19 @@ pub fn recursive_extract(dir: &Path, opts: &ExtractOptions) -> ExtractResult<()>
             match extract_archive(&archive_path, extract_dir, opts) {
                 Ok(()) => {
                     if let Err(e) = fs::remove_file(&archive_path) {
-                        eprintln!("Warning: could not delete {}: {}", archive_path.display(), e);
+                        eprintln!(
+                            "Warning: could not delete {}: {}",
+                            archive_path.display(),
+                            e
+                        );
                     }
                 }
                 Err(e) => {
-                    eprintln!("Warning: failed to extract {}: {}", archive_path.display(), e);
+                    eprintln!(
+                        "Warning: failed to extract {}: {}",
+                        archive_path.display(),
+                        e
+                    );
                     let _ = fs::remove_file(&archive_path);
                 }
             }
@@ -266,7 +349,11 @@ pub fn recursive_extract(dir: &Path, opts: &ExtractOptions) -> ExtractResult<()>
     Ok(())
 }
 
-pub fn extract_all(archive_path: &Path, output_dir: &Path, opts: &ExtractOptions) -> ExtractResult<PathBuf> {
+pub fn extract_all(
+    archive_path: &Path,
+    output_dir: &Path,
+    opts: &ExtractOptions,
+) -> ExtractResult<PathBuf> {
     let archive_name = archive_path
         .file_stem()
         .and_then(OsStr::to_str)
@@ -275,7 +362,11 @@ pub fn extract_all(archive_path: &Path, output_dir: &Path, opts: &ExtractOptions
     let extract_dir = output_dir.join(archive_name);
     fs::create_dir_all(&extract_dir)?;
 
-    eprintln!("Extracting {} to {}", archive_path.display(), extract_dir.display());
+    eprintln!(
+        "Extracting {} to {}",
+        archive_path.display(),
+        extract_dir.display()
+    );
 
     extract_archive(archive_path, &extract_dir, opts)?;
     recursive_extract(&extract_dir, opts)?;
@@ -294,7 +385,16 @@ mod tests {
         assert!(is_archive(Path::new("test.7z")));
         assert!(is_archive(Path::new("test.rar")));
         assert!(is_archive(Path::new("test.tar.gz")));
+        assert!(is_archive(Path::new("test.zip.001")));
+        assert!(is_archive(Path::new("test.7z.001")));
+        assert!(is_archive(Path::new("test.tar.gz.001")));
+        assert!(is_archive(Path::new("test.tgz.001")));
+        assert!(is_archive(Path::new("test.part1.rar")));
+        assert!(is_archive(Path::new("test.part01.rar")));
         assert!(!is_archive(Path::new("test.txt")));
         assert!(!is_archive(Path::new("test.json")));
+        assert!(!is_archive(Path::new("test.zip.002")));
+        assert!(!is_archive(Path::new("test.part2.rar")));
+        assert!(!is_archive(Path::new("test.z01")));
     }
 }
